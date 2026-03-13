@@ -24,6 +24,32 @@ const mkdir = fs.promises.mkdir;
 const rm = fs.promises.rm;
 const readdir = fs.promises.readdir;
 
+// Allowed MIME types for upload validation
+const ALLOWED_MIME_TYPES = new Set([
+    "image/png",
+    "image/jpeg",
+    "image/jpg",
+    "image/webp",
+]);
+
+// PNG magic bytes: 89 50 4E 47 0D 0A 1A 0A
+const PNG_MAGIC = [0x89, 0x50, 0x4e, 0x47];
+// JPEG magic bytes: FF D8 FF
+const JPEG_MAGIC = [0xff, 0xd8, 0xff];
+// WebP magic bytes: 52 49 46 46 ... 57 45 42 50 (RIFF....WEBP)
+const RIFF_MAGIC = [0x52, 0x49, 0x46, 0x46];
+const WEBP_MAGIC = [0x57, 0x45, 0x42, 0x50];
+
+function validateMagicBytes(buffer: Buffer): boolean {
+    if (buffer.length < 12) return false;
+    const matchesPng = PNG_MAGIC.every((b, i) => buffer[i] === b);
+    const matchesJpeg = JPEG_MAGIC.every((b, i) => buffer[i] === b);
+    const matchesWebp =
+        RIFF_MAGIC.every((b, i) => buffer[i] === b) &&
+        WEBP_MAGIC.every((b, i) => buffer[i + 8] === b);
+    return matchesPng || matchesJpeg || matchesWebp;
+}
+
 export async function POST(req: NextRequest) {
     let workDir = "";
 
@@ -31,6 +57,7 @@ export async function POST(req: NextRequest) {
         const formData = await req.formData();
         const file = formData.get("image") as File;
         const iterationsInput = formData.get("iterations");
+        const customPrompt = formData.get("prompt") as string | null;
 
         // Clamp iterations: 1 to 99
         let iterations = iterationsInput ? parseInt(iterationsInput as string) : 99;
@@ -42,18 +69,33 @@ export async function POST(req: NextRequest) {
             return NextResponse.json({ error: "No image provided" }, { status: 400 });
         }
 
+        // Validate MIME type
+        if (!ALLOWED_MIME_TYPES.has(file.type)) {
+            return NextResponse.json({ error: "Invalid file type. Allowed: PNG, JPG, WebP." }, { status: 400 });
+        }
+
         // Hardening: Max upload size (10MB)
         if (file.size > 10 * 1024 * 1024) {
             return NextResponse.json({ error: "Image too large. Max 10MB." }, { status: 400 });
         }
 
+        // Validate magic bytes
+        const uploadBuffer = Buffer.from(await file.arrayBuffer());
+        if (!validateMagicBytes(uploadBuffer)) {
+            return NextResponse.json({ error: "File content does not match a valid image format." }, { status: 400 });
+        }
+
         const openaiApiKey = process.env.OPENAI_API_KEY;
-        console.log("DEBUG: API Key present:", !!openaiApiKey, "First 7:", openaiApiKey ? openaiApiKey.substring(0, 7) : "N/A");
         if (!openaiApiKey) {
             return NextResponse.json({ error: "OPENAI_API_KEY not set" }, { status: 500 });
         }
 
         const openai = new OpenAI({ apiKey: openaiApiKey });
+
+        // Determine the generation prompt
+        const prompt = (customPrompt && customPrompt.trim())
+            ? customPrompt.trim().slice(0, 500)
+            : "Recreate this image as you see it.";
 
         // A. Use Vercel-safe temp directory
         const timestamp = Date.now();
@@ -62,18 +104,17 @@ export async function POST(req: NextRequest) {
 
         // B. Handle Upload and Convert to PNG
         // Save original upload with correct extension (Whitelist approach)
-        const uploadBuffer = await file.arrayBuffer();
         let uploadExt = "png"; // Default
         if (file.type === "image/png") uploadExt = "png";
         else if (file.type === "image/jpeg" || file.type === "image/jpg") uploadExt = "jpg";
         else if (file.type === "image/webp") uploadExt = "webp";
 
         const uploadPath = path.join(workDir, `upload.${uploadExt}`);
-        await writeFile(uploadPath, Buffer.from(uploadBuffer));
+        await writeFile(uploadPath, uploadBuffer);
 
         // Convert to strict step-000.png with overwrite flag
         const step0Path = path.join(workDir, "step-000.png");
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
             ffmpeg(uploadPath)
                 .outputOptions(["-y"]) // Force overwrite
                 .output(step0Path)
@@ -83,20 +124,20 @@ export async function POST(req: NextRequest) {
         });
 
         // C. Orientation Lock (Probe step-000.png)
-        const metadata: any = await new Promise((resolve, reject) => {
-            ffmpeg.ffprobe(step0Path, (err, metadata) => {
+        const metadata = await new Promise<{ streams: Array<{ width?: number; height?: number }> }>((resolve, reject) => {
+            ffmpeg.ffprobe(step0Path, (err: Error | null, data: { streams: Array<{ width?: number; height?: number }> }) => {
                 if (err) reject(err);
-                else resolve(metadata);
+                else resolve(data);
             });
         });
 
-        const stream = metadata.streams.find((s: any) => s.width && s.height);
-        if (!stream) {
+        const videoStream = metadata.streams.find((s) => s.width && s.height);
+        if (!videoStream) {
             throw new Error("Could not determine image dimensions");
         }
 
-        const width = stream.width;
-        const height = stream.height;
+        const width = videoStream.width!;
+        const height = videoStream.height!;
         const ratio = width / height;
 
         let size: "1024x1024" | "1536x1024" | "1024x1536";
@@ -110,12 +151,12 @@ export async function POST(req: NextRequest) {
 
         // Mask setup (Lazy creation if needed)
         let maskPath: string | null = null;
-        const ensureMask = async () => {
+        const ensureMask = async (): Promise<string> => {
             if (maskPath) return maskPath;
             const mPath = path.join(workDir, "mask.png");
             // Create transparent mask matching the TARGET size
             const [w, h] = size.split("x");
-            await new Promise((resolve, reject) => {
+            await new Promise<void>((resolve, reject) => {
                 ffmpeg()
                     .input(`color=c=black@0.0:s=${w}x${h}`)
                     .inputFormat("lavfi")
@@ -134,14 +175,15 @@ export async function POST(req: NextRequest) {
         let currentImagePath = step0Path;
 
         for (let i = 1; i <= iterations; i++) {
+            console.log(`Step ${i}/${iterations}: generating...`);
             const imageStream = fs.createReadStream(currentImagePath);
 
             try {
                 // E. OpenAI Call
-                const params: any = {
+                const params: Record<string, unknown> = {
                     model: "gpt-image-1",
                     image: imageStream,
-                    prompt: "Recreate this image as you see it.",
+                    prompt,
                     n: 1,
                     size: size,
                     response_format: "b64_json"
@@ -150,22 +192,23 @@ export async function POST(req: NextRequest) {
                 let b64: string | undefined;
 
                 try {
-                    // @ts-ignore
-                    const response = await openai.images.edit(params);
-                    // @ts-ignore
-                    b64 = response.data[0].b64_json;
-                } catch (err: any) {
+                    const response = await openai.images.edit(params as Parameters<typeof openai.images.edit>[0]);
+                    b64 = (response as unknown as { data: Array<{ b64_json?: string }> }).data[0]?.b64_json;
+                } catch (err: unknown) {
+                    const errMsg = err instanceof Error ? err.message : String(err);
                     // Fallback for mask requirement
-                    if (err.message && err.message.toLowerCase().includes("mask")) {
+                    if (errMsg.toLowerCase().includes("mask")) {
                         console.log(`Step ${i}: Mask required, retrying with transparent mask.`);
                         const mPath = await ensureMask();
                         const maskStream = fs.createReadStream(mPath);
-                        const retryParams = { ...params, mask: maskStream, image: fs.createReadStream(currentImagePath) }; // Re-create stream
+                        const retryParams = {
+                            ...params,
+                            mask: maskStream,
+                            image: fs.createReadStream(currentImagePath), // Re-create consumed stream
+                        };
 
-                        // @ts-ignore
-                        const retryResponse = await openai.images.edit(retryParams);
-                        // @ts-ignore
-                        b64 = retryResponse.data[0].b64_json;
+                        const retryResponse = await openai.images.edit(retryParams as Parameters<typeof openai.images.edit>[0]);
+                        b64 = (retryResponse as unknown as { data: Array<{ b64_json?: string }> }).data[0]?.b64_json;
                     } else {
                         throw err;
                     }
@@ -179,15 +222,16 @@ export async function POST(req: NextRequest) {
 
                 currentImagePath = nextStepPath;
 
-            } catch (error: any) {
-                console.error(`Error at step ${i}:`, error);
+            } catch (error: unknown) {
+                const errMsg = error instanceof Error ? error.message : String(error);
+                console.error(`Error at step ${i}:`, errMsg);
                 throw error; // Fail fast
             }
         }
 
         // F. Video Generation
         const videoPath = path.join(workDir, "output.mp4");
-        await new Promise((resolve, reject) => {
+        await new Promise<void>((resolve, reject) => {
             ffmpeg()
                 // Force start at 0 to include original
                 .input(path.join(workDir, "step-%03d.png"))
@@ -209,23 +253,25 @@ export async function POST(req: NextRequest) {
             }
         }
 
-        // Prepare stream cleanup on 'close'
-        archive.on("close", () => {
-            setTimeout(() => {
-                rm(workDir, { recursive: true, force: true }).catch(console.error);
-            }, 1000);
+        // Cleanup temp dir after archive stream is fully consumed
+        const cleanupWorkDir = () => {
+            rm(workDir, { recursive: true, force: true }).catch(console.error);
+        };
+
+        archive.on("end", () => {
+            cleanupWorkDir();
         });
 
-        archive.on("error", (err) => {
+        archive.on("error", (err: Error) => {
             console.error("Archive error:", err);
-            rm(workDir, { recursive: true, force: true }).catch(console.error);
+            cleanupWorkDir();
         });
 
         archive.finalize();
 
-        const webStream = Readable.toWeb(archive as Readable);
+        const webStream = Readable.toWeb(archive as unknown as Readable);
 
-        return new NextResponse(webStream as any, {
+        return new NextResponse(webStream as ReadableStream, {
             status: 200,
             headers: {
                 "Content-Type": "application/zip",
@@ -233,11 +279,12 @@ export async function POST(req: NextRequest) {
             }
         });
 
-    } catch (error: any) {
-        console.error("Pipeline failed:", error);
+    } catch (error: unknown) {
+        const errMsg = error instanceof Error ? error.message : "Internal Server Error";
+        console.error("Pipeline failed:", errMsg);
         if (workDir) {
             await rm(workDir, { recursive: true, force: true }).catch(console.error);
         }
-        return NextResponse.json({ error: error.message || "Internal Server Error" }, { status: 500 });
+        return NextResponse.json({ error: errMsg }, { status: 500 });
     }
 }
